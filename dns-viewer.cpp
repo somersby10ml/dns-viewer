@@ -213,53 +213,79 @@ public:
 
 	uint8_t* CreateDNSResponse(uint8_t* originalPacket, int originalLen,
 		const std::string& domain, const std::string& newIP, int& newLen) {
-		// Calculate new packet size
-		newLen = originalLen + sizeof(DNSAnswer);
+
+		// DNS 응답은 원본 쿼리 + 응답 레코드 (12바이트)
+		// 응답 레코드: name pointer(2) + type(2) + class(2) + ttl(4) + length(2) + IP(4) = 16바이트
+		newLen = originalLen + 16;
 		uint8_t* newPacket = new uint8_t[newLen];
 		memcpy(newPacket, originalPacket, originalLen);
 
-		// Modify IP header
+		// IP 헤더 수정
 		WINDIVERT_IPHDR* ipHdr = (WINDIVERT_IPHDR*)newPacket;
 		WINDIVERT_IPHDR* origIpHdr = (WINDIVERT_IPHDR*)originalPacket;
 
-		// Swap sender and receiver IP
-		ipHdr->SrcAddr = origIpHdr->DstAddr;
-		ipHdr->DstAddr = origIpHdr->SrcAddr;
+		// IP 주소 교환
+		uint32_t tempAddr = ipHdr->SrcAddr;
+		ipHdr->SrcAddr = ipHdr->DstAddr;
+		ipHdr->DstAddr = tempAddr;
+
+		// IP 패킷 전체 길이 업데이트
 		ipHdr->Length = htons(newLen);
+		ipHdr->Checksum = 0; // 체크섬은 나중에 재계산
 
-		// Modify UDP header
+		// UDP 헤더 수정
 		WINDIVERT_UDPHDR* udpHdr = (WINDIVERT_UDPHDR*)(newPacket + sizeof(WINDIVERT_IPHDR));
-		WINDIVERT_UDPHDR* origUdpHdr = (WINDIVERT_UDPHDR*)(originalPacket + sizeof(WINDIVERT_IPHDR));
 
+		// 포트 교환
 		uint16_t tempPort = udpHdr->SrcPort;
-		udpHdr->SrcPort = origUdpHdr->DstPort;
+		udpHdr->SrcPort = udpHdr->DstPort;
 		udpHdr->DstPort = tempPort;
-		udpHdr->Length = htons(newLen - sizeof(WINDIVERT_IPHDR));
 
-		// Modify DNS header
+		// UDP 길이 = UDP 헤더 + DNS 데이터
+		uint16_t udpLen = newLen - sizeof(WINDIVERT_IPHDR);
+		udpHdr->Length = htons(udpLen);
+		udpHdr->Checksum = 0; // 체크섬은 나중에 재계산
+
+		// DNS 헤더 수정
 		DNSHeader* dnsHdr = (DNSHeader*)(newPacket + sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR));
-		dnsHdr->flags = htons(0x8180); // Response flags
-		dnsHdr->answers = htons(1); // One response
+		dnsHdr->flags = htons(0x8180); // 표준 응답 플래그: QR=1, Opcode=0, AA=1, TC=0, RD=1, RA=1, Z=0, RCODE=0
+		dnsHdr->answers = htons(1);    // 응답 레코드 1개
+		dnsHdr->authority = htons(0);
+		dnsHdr->additional = htons(0);
 
-		// Add DNS response
+		// DNS 응답 레코드 추가
 		int answerOffset = originalLen;
-		DNSAnswer* answer = (DNSAnswer*)(newPacket + answerOffset);
-		answer->name = htons(0xC00C); // Compressed name pointer
-		answer->type = htons(1); // A record
-		answer->class_ = htons(1); // IN class
-		answer->ttl = htonl(300); // 5 minute TTL
-		answer->length = htons(4); // IPv4 address length
+		uint8_t* answerPtr = newPacket + answerOffset;
 
-		// IP address conversion
+		// Name pointer (압축된 이름 참조)
+		*(uint16_t*)answerPtr = htons(0xC00C); // 쿼리 섹션의 이름을 가리킴
+		answerPtr += 2;
+
+		// Type (A record)
+		*(uint16_t*)answerPtr = htons(1);
+		answerPtr += 2;
+
+		// Class (IN)
+		*(uint16_t*)answerPtr = htons(1);
+		answerPtr += 2;
+
+		// TTL (300 seconds)
+		*(uint32_t*)answerPtr = htonl(300);
+		answerPtr += 4;
+
+		// Data length (4 bytes for IPv4)
+		*(uint16_t*)answerPtr = htons(4);
+		answerPtr += 2;
+
+		// IP 주소
 		uint32_t ipAddr;
 		if (inet_pton(AF_INET, newIP.c_str(), &ipAddr) == 1) {
-			answer->address = ipAddr;
+			*(uint32_t*)answerPtr = ipAddr;
 		}
 		else {
-			// Default value on conversion failure (127.0.0.1)
-			uint32_t defaultAddr;
-			inet_pton(AF_INET, "127.0.0.1", &defaultAddr);
-			answer->address = defaultAddr;
+			// 실패시 127.0.0.1
+			inet_pton(AF_INET, "127.0.0.1", &ipAddr);
+			*(uint32_t*)answerPtr = ipAddr;
 		}
 
 		return newPacket;
@@ -311,6 +337,7 @@ public:
 				// Set response direction (inbound)
 				WINDIVERT_ADDRESS responseAddr = addr;
 				responseAddr.Outbound = 0; // Set to inbound
+				responseAddr.Loopback = 1; // 로컬 응답임을 명시
 
 				// Recalculate checksums
 				WinDivertHelperCalcChecksums(response, responseLen, &responseAddr, 0);
